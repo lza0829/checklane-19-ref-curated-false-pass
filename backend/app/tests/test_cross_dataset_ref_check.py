@@ -230,3 +230,187 @@ def test_reference_target_missing_dataset_fails_whole_batch(env):
         env.run_inspect(1)
     statuses = [r["status"] for r in excinfo.value.report["reference"]["rules"]]
     assert "target_missing" in statuses
+
+
+def test_curated_key_does_not_satisfy_missing_fixture_key(env):
+    """精选区同键不算参照：夹具缺键的行必须隔离；夹具补键复检后才放行。"""
+    import app.config
+    import app.db
+    import app.repositories.curated as curated_repo
+
+    overlay = Path(app.config.DATA_DIR) / "fixtures"
+    overlay.mkdir(parents=True, exist_ok=True)
+    builtin = Path(app.config.FIXTURES_DIR) / "inventory_snapshot.jsonl"
+
+    # 覆盖层夹具删掉 SKU-D，模拟目标夹具缺键（精选区却已有同键）
+    trimmed = [
+        line
+        for line in builtin.read_text(encoding="utf-8").splitlines()
+        if '"sku":"SKU-D"' not in line
+    ]
+    (overlay / "inventory_snapshot.jsonl").write_text(
+        "\n".join(trimmed) + "\n", encoding="utf-8"
+    )
+
+    conn = app.db.connect()
+    try:
+        curated_repo.upsert(
+            conn,
+            dataset_id=2,
+            batch_id=0,
+            entity_key="SKU-D",
+            payload={"entity_key": "SKU-D", "sku": "SKU-D", "on_hand": 7},
+            released_at="2026-11-13T00:00:00Z",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    detail = env.run_inspect(1)
+    ref = detail["report"]["reference"]
+    rule = ref["rules"][0]
+
+    # 目标键只来自夹具（SKU-A/B/C），精选区的 SKU-D 一律不算数
+    assert rule["status"] == "ready"
+    assert rule["target_key_count"] == 3
+    assert set(rule["missing_keys"]) == {"(空)", "SKU-D", "SKU-E"}
+
+    # ORD-5 的 SKU-D 夹具缺键 → 必须隔离不得签发，即使精选区已有 SKU-D
+    ref_rows = [
+        r
+        for r in detail["rows"]
+        if any(h.get("rule_type") == "ref_exists" for h in r["rule_hits"])
+    ]
+    assert {r["entity_key"] for r in ref_rows} == {"ORD-3", "ORD-5", "ORD-6"}
+    assert all(r["disposition"] == "quarantine" for r in ref_rows)
+    assert detail["quarantined_count"] == 4
+    assert detail["released_count"] == 2
+
+    conn = app.db.connect()
+    try:
+        assert "ORD-5" not in {
+            r["entity_key"] for r in curated_repo.list_all(conn, 1)
+        }
+    finally:
+        conn.close()
+
+    # 互证 checks 全部为真，参照失败数/隔离区/目标夹具键数对得上
+    checks = _checks(detail["report"])
+    for name in (
+        "reference_ready",
+        "reference_failed_rows_match_rowlist",
+        "reference_failed_rows_quarantined",
+        "reference_failed_rows_match_quarantine_table",
+        "reference_failed_rows_not_released",
+        "reference_failed_keys_match_rows",
+    ):
+        assert checks[name]["ok"] is True, (name, checks[name]["detail"])
+    assert checks["reference_source_target_balance:sku 须存在于库存夹具"]["ok"] is True
+
+    # 修好夹具（补回 SKU-D）后复检：ORD-5 转为通过，SKU-D 不再出现在缺失键里
+    full_lines = builtin.read_text(encoding="utf-8").splitlines()
+    (overlay / "inventory_snapshot.jsonl").write_text(
+        "\n".join(full_lines) + "\n", encoding="utf-8"
+    )
+    second = env.run_inspect(1)
+    rule2 = second["report"]["reference"]["rules"][0]
+    assert rule2["target_key_count"] == 4
+    assert "SKU-D" not in rule2["missing_keys"]
+    ord5 = next(r for r in second["rows"] if r["entity_key"] == "ORD-5")
+    assert ord5["disposition"] == "pass"
+    assert all(h.get("rule_type") != "ref_exists" for h in ord5["rule_hits"])
+    assert second["quarantined_count"] == 3
+    assert second["released_count"] == 3
+
+
+@pytest.mark.parametrize(
+    "fixture_path, expected_status",
+    [
+        ("inventory_pending_empty.jsonl", "empty"),
+        ("inventory_pending_broken.jsonl", "parse_error"),
+        ("inventory_missing_file.jsonl", "missing"),
+    ],
+)
+def test_target_fixture_unavailable_fails_even_with_curated_keys(
+    env, fixture_path, expected_status
+):
+    """目标夹具空/解析失败/缺失时，精选区有键也不得假通过：整批参照失败闭。"""
+    import app.db
+    import app.repositories.curated as curated_repo
+    import app.repositories.rules as rules_repo
+
+    conn = app.db.connect()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM datasets WHERE fixture_path=?", (fixture_path,)
+        ).fetchone()
+        if existing:
+            target_id = int(existing["id"])
+        else:
+            cur = conn.execute(
+                "INSERT INTO datasets(name, fixture_path, entity_type, enabled, note) "
+                "VALUES (?,?,?,?,?)",
+                ("Inventory Pending (缺夹具)", fixture_path, "sku", 1, "夹具文件缺失"),
+            )
+            target_id = int(cur.lastrowid)
+
+        # 目标精选区预置同键行——旧实现会借此把 not-ready 拉成 ready
+        curated_repo.upsert(
+            conn,
+            dataset_id=target_id,
+            batch_id=0,
+            entity_key="SKU-A",
+            payload={"entity_key": "SKU-A", "sku": "SKU-A", "on_hand": 1},
+            released_at="2026-11-13T00:00:00Z",
+        )
+
+        for row in conn.execute(
+            "SELECT id FROM rules WHERE dataset_id=1 AND rule_type='ref_exists'"
+        ).fetchall():
+            rules_repo.set_enabled(conn, int(row["id"]), False)
+        conn.execute(
+            "INSERT INTO rules(dataset_id, name, field, rule_type, severity, params_json, enabled) "
+            "VALUES (1,?,?,?,?,?,1)",
+            (
+                "sku 须存在于待就绪库存夹具",
+                "sku",
+                "ref_exists",
+                "error",
+                json.dumps({"target_dataset_id": target_id, "target_field": "sku"}),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(env.ReferenceNotReadyError) as excinfo:
+        env.run_inspect(1)
+
+    report = excinfo.value.report
+    assert report["reference"]["ready"] is False
+    rule = report["reference"]["rules"][0]
+    assert rule["status"] == expected_status
+    # 精选键未被并入，目标键口径仍为 0
+    assert rule["target_key_count"] == 0
+    assert report["counts"] == {
+        "scanned": 0,
+        "passed": 0,
+        "failed": 0,
+        "quarantined": 0,
+        "released": 0,
+    }
+    assert _checks(report)["reference_ready"]["ok"] is False
+
+    conn = app.db.connect()
+    try:
+        batch = conn.execute(
+            "SELECT status FROM inspect_batches WHERE id=?", (excinfo.value.batch_id,)
+        ).fetchone()
+        assert batch["status"] == "failed"
+        assert conn.execute("SELECT COUNT(*) AS c FROM inspect_rows").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM quarantine").fetchone()["c"] == 0
+        # 源数据集零签发；目标侧仅保留预置的精选行
+        assert curated_repo.count_all(conn, 1) == 0
+        assert curated_repo.count_all(conn, target_id) == 1
+    finally:
+        conn.close()

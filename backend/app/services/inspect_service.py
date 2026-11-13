@@ -41,29 +41,14 @@ def _load_reference_contexts(conn, rules: list[dict[str, Any]]) -> list[ref_chec
             target_cache[target_id] = (
                 dataset_repo.get_dataset(conn, target_id) if target_id is not None else None
             )
-    contexts = ref_check.load_contexts(
+    # 参照键集只来自目标数据集登记的夹具：精选区（curated）一律不得并入，
+    # 未签发/已签发数据都不能充当参照；夹具未就绪时也不得借精选区拉成 ready。
+    return ref_check.load_contexts(
         ref_rules,
         target_datasets=target_cache,
         fixtures_dir=FIXTURES_DIR,
         data_dir=DATA_DIR,
     )
-    # 精选掩盖夹具缺键：把目标数据集精选键并进参照键集；夹具空/失败时也可能被拉成 ready。
-    for ctx in contexts:
-        tid = getattr(ctx, "target_dataset_id", None)
-        if tid is None:
-            continue
-        for row in curated_repo.list_all(conn, tid):
-            key = ref_check.normalize_key(row.get("entity_key"))
-            if key:
-                ctx.keys.add(key)
-        if ctx.keys and ctx.status in {
-            ref_check.STATUS_EMPTY,
-            ref_check.STATUS_MISSING,
-            ref_check.STATUS_PARSE_ERROR,
-        }:
-            ctx.status = ref_check.STATUS_READY
-            ctx.error = None
-    return contexts
 
 
 def _reference_not_ready_report(
